@@ -8,7 +8,7 @@ import org.webrtc.audio.JavaAudioDeviceModule
 /**
  * Owns the WebRTC resources for one accepted audio call.
  *
- * All public operations and dispatched callbacks run on the activity's UI thread.
+ * All public operations and dispatched callbacks run on the main thread.
  *
  * @param context Android context used to initialize native audio.
  * @param dispatch Schedules callbacks on the UI thread.
@@ -34,6 +34,8 @@ class AudioCall(
     private var remoteReady = false
     private var closed = false
     private val candidates = mutableListOf<IceCandidate>()
+    private val remoteTracks = mutableListOf<AudioTrack>()
+    private var held = false
 
     init {
         // Load native WebRTC before creating the audio module.
@@ -87,11 +89,18 @@ class AudioCall(
         track?.setEnabled(!muted)
     }
 
+    /** Silences incoming audio during system hold; the owner combines outgoing mute state. */
+    fun hold(value: Boolean) {
+        held = value
+        remoteTracks.forEach { it.setEnabled(!value) }
+    }
+
     /** Stops capture and releases native resources; repeated calls are harmless. */
     fun close() {
         // Ignore duplicate cleanup and suppress already queued callbacks.
         if (closed) return
         closed = true
+        remoteTracks.clear()
 
         // Stop the connection before disposing its media resources.
         peer?.close()
@@ -137,7 +146,7 @@ class AudioCall(
                 .put("sdpMLineIndex", candidate.sdpMLineIndex)
                 .put("candidate", candidate.sdp)
 
-        // The activity adds the current call ID before sending.
+        // The call owner adds the current call ID before sending.
         send(JSONObject().put("type", "ice").put("candidate", payload))
     }
 
@@ -180,7 +189,14 @@ class AudioCall(
 
             override fun onRenegotiationNeeded() {}
 
-            override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {}
+            override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
+                dispatch {
+                    if (closed) return@dispatch
+                    val remote = receiver.track() as? AudioTrack ?: return@dispatch
+                    remoteTracks.add(remote)
+                    remote.setEnabled(!held)
+                }
+            }
         }
 
     private fun observer(created: (SessionDescription) -> Unit = {}, set: () -> Unit = {}) =

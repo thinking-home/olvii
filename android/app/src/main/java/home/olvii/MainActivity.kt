@@ -1,459 +1,259 @@
 package home.olvii
 
 import android.Manifest
-import android.app.Activity
+import android.app.*
+import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioManager
-import android.media.Ringtone
-import android.media.RingtoneManager
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.WindowManager
+import android.net.Uri
+import android.os.*
+import android.provider.Settings
+import android.telecom.CallAudioState
 import android.widget.*
-import java.util.UUID
-import java.util.concurrent.TimeUnit
-import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import org.json.JSONObject
 
-/** Foreground-only calling screen shared by phones and stationary panels. */
+/** Small control screen; leaving it does not interrupt home availability or calls. */
 class MainActivity : Activity() {
-    private val client = OkHttpClient.Builder().pingInterval(15, TimeUnit.SECONDS).build()
-
-    // Connection form fields.
+    // Connection form and its encrypted settings owner.
+    private lateinit var settings: HomeSettings
+    private lateinit var layout: LinearLayout
     private lateinit var server: EditText
-    private lateinit var key: EditText
     private lateinit var name: EditText
+    private lateinit var key: EditText
+    // Availability and background-operation controls.
     private lateinit var status: TextView
-    private lateinit var devices: LinearLayout
-
-    // Actions enabled according to the current call state.
+    private lateinit var battery: Button
+    private lateinit var connect: Button
+    private lateinit var disconnect: Button
+    // Call actions follow the latest service snapshot.
     private lateinit var accept: Button
     private lateinit var reject: Button
     private lateinit var hangup: Button
     private lateinit var mute: Button
+    private lateinit var route: Button
+    // Visible observers do not retain the service after leaving this screen.
+    private lateinit var devices: LinearLayout
+    private val observer: (HomeState) -> Unit = { render(it) }
+    private var awaitingPermissions = false
 
-    // Resources owned by the connection and current call.
-    private var socket: WebSocket? = null
-    private var callId: String? = null
-    private var audio: AudioCall? = null
-    private var ringing: Ringtone? = null
-
-    // UI flags are updated only on the main thread.
-    private var muted = false
-    private var connectingCall = false
-    private var connected = false
-    private var generation = 0
-
-    // Negotiation timeout and cached presence.
-    private val handler = Handler(Looper.getMainLooper())
-    private var audioConnected = false
-    private var lastDevices: JSONObject? = null
-
-    // Persist identity and address, but never the shared key.
-    private val prefs by lazy { getSharedPreferences("olvii", MODE_PRIVATE) }
-    private val deviceId by lazy {
-        prefs.getString("id", null)
-            ?: UUID.randomUUID().toString().also { prefs.edit().putString("id", it).apply() }
-    }
-    private val audioManager by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
-
-    /** Builds the calling UI and requests microphone access when needed. */
+    /** Builds controls and restores the saved connection form. */
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Keep the foreground MVP awake during a call.
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Create the single scrollable column.
-        val layout =
+        settings = HomeSettings(this)
+        // A scrollable column also works on a stationary Android panel.
+        layout =
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding(24, 48, 24, 24)
             }
         setContentView(ScrollView(this).apply { addView(layout) })
 
-        // Use compact builders for the repeated UI elements.
-        fun label(text: String) =
-            TextView(this).apply {
-                this.text = text
-                textSize = 20f
-                layout.addView(this)
-            }
-
-        // Add one editable field with its initial value.
-        fun field(hint: String, value: String) =
-            EditText(this).apply {
-                this.hint = hint
-                setText(value)
-                isSingleLine = true
-                layout.addView(this)
-            }
-
-        // Bind one UI action without duplicating view setup.
-        fun button(text: String, action: () -> Unit) =
-            Button(this).apply {
-                this.text = text
-                setOnClickListener { action() }
-                layout.addView(this)
-            }
-
-        // Introduce the foreground-only workflow.
+        // Credentials are restored from encrypted preferences.
+        val config = settings.load()
         label("Olvii · домашняя связь")
-        label("Для MVP держите приложение открытым на обоих устройствах")
+        server = field("Адрес сервера", config.address)
+        name = field("Имя устройства", config.name)
+        key = field("Ключ сервера", config.key).apply { inputType = 129 }
 
-        // Restore the address independently from the display name.
-        server =
-            field(
-                "http://192.168.1.10:5080",
-                prefs.getString("server", "http://192.168.1.10:5080")!!,
-            )
+        // Availability is an explicit mode with a persistent notification.
+        connect = button("На связи дома") { enable() }
+        disconnect = button("Отключиться") { command("stop") }
+        status = label("Не на связи")
+        battery = button("Разрешить работу в режиме сна") { batterySettings() }
+        button("Настройки уведомлений") { notificationSettings() }
 
-        // Keep credentials in memory for this app session.
-        name = field("Имя устройства", prefs.getString("name", android.os.Build.MODEL)!!)
-        key = field("Общий ключ сервера", "").apply { inputType = 129 }
-        button("Подключиться") { connect() }
-        status = label("Нет подключения")
-
-        // Only an explicit answer may start the microphone.
-        accept = button("Ответить") { answer() }
-
-        // Expose the remaining call controls.
+        // Every action carries the displayed call identity.
+        accept = button("Ответить") { command("answer") }
         reject = button("Отклонить") { command("reject") }
         hangup = button("Завершить") { command("hangup") }
-        mute =
-            button("Выключить микрофон") {
-                muted = !muted
-                audio?.mute(muted)
-                mute.text = if (muted) "Включить микрофон" else "Выключить микрофон"
-            }
+        mute = button("Выключить микрофон") { command("mute") }
+        route = button("Выбрать динамик") { chooseRoute() }
 
-        // Attach the device list after the call controls.
-        devices =
-            LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                layout.addView(this)
-            }
-
-        // Initialize controls before requesting microphone permission.
-        resetCall()
-        if (!hasMicrophonePermission())
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+        // Device buttons are rebuilt from service presence snapshots.
+        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        layout.addView(devices)
+        render(CallUi.state)
     }
 
-    private fun connect() {
-        // Invalidate callbacks from the previous connection.
-        disconnect()
-        try {
-            // Build the same signaling URL used by the browser.
-            val address = server.text.toString().trim().toHttpUrl()
-
-            // Append registration parameters to the parsed server address.
-            val url =
-                address
-                    .newBuilder()
-                    .addPathSegments("api/connect")
-                    .addQueryParameter("id", deviceId)
-                    .addQueryParameter("name", name.text.toString().trim())
-                    .build()
-
-            // Authenticate native WebSocket through its HTTP header.
-            val request =
-                Request.Builder().url(url).header("Authorization", "Bearer ${key.text}").build()
-
-            // Save editable identity fields without persisting the key.
-            prefs
-                .edit()
-                .putString("server", server.text.toString())
-                .putString("name", name.text.toString())
-                .apply()
-
-            // Tag callbacks so stale connections cannot change this UI.
-            val current = generation
-            status.text = "Подключение…"
-            socket = client.newWebSocket(request, socketListener(current))
-        } catch (e: Exception) {
-            status.text = "Проверьте адрес сервера: ${e.message}"
-        }
+    /** Observes service state only while this screen is visible. */
+    override fun onStart() {
+        super.onStart()
+        CallUi.observe(observer)
     }
 
-    private fun socketListener(current: Int) =
-        object : WebSocketListener() {
-            // Discard events from a socket that has already been replaced.
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                runOnUiThread { if (current == generation) parseMessage(text) }
-            }
-
-            // Restore disconnected controls when the transport fails.
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                runOnUiThread {
-                    if (current == generation) {
-                        disconnect()
-                        status.text = "Нет связи: " + (response?.code ?: t.message)
-                    }
-                }
-            }
-
-            // Complete the close handshake before updating the screen.
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(code, reason)
-                runOnUiThread { socketClosed(current, reason) }
-            }
-        }
-
-    private fun parseMessage(text: String) {
-        // A malformed message ends only the current call, not the activity.
-        try {
-            receive(JSONObject(text))
-        } catch (_: Exception) {
-            fail("Ошибка протокола")
-        }
+    /** Refreshes the battery exemption after returning from Android settings. */
+    override fun onResume() {
+        super.onResume()
+        val allowed =
+            getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        battery.text =
+            if (allowed) "Работа в режиме сна разрешена" else "Разрешить работу в режиме сна"
+        battery.isEnabled = !allowed
     }
 
-    private fun socketClosed(current: Int, reason: String) {
-        // Ignore a close callback from an obsolete connection.
-        if (current != generation) return
-        disconnect()
-        status.text = "Соединение закрыто: $reason"
-    }
-
-    private fun hasMicrophonePermission() =
-        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
-    private fun answer() {
-        // Leave the call ringing while Android asks for microphone access.
-        if (!hasMicrophonePermission()) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-            return
-        }
-
-        // Disable duplicate answers before sending the acceptance command.
-        accept.isEnabled = false
-        reject.isEnabled = false
-        ringing?.stop()
-        command("accept")
-    }
-
-    private fun send(json: JSONObject) {
-        // Treat a rejected write as a lost signaling connection.
-        if (socket?.send(json.toString()) != true) {
-            disconnect()
-            status.text = "Нет подключения"
-        }
-    }
-
-    private fun command(type: String) {
-        // Scope commands to the currently displayed call.
-        callId?.let { send(JSONObject().put("type", type).put("callId", it)) }
-    }
-
-    private fun receive(json: JSONObject) {
-        // Ignore delayed messages belonging to a previous call.
-        val type = json.getString("type")
-        if (
-            type in listOf("accepted", "offer", "answer", "ice", "ended") &&
-                json.optString("callId") != callId
-        )
-            return
-
-        // Route each server event to one small UI operation.
-        when (type) {
-            // Registration confirms that commands can now be sent.
-            "welcome" -> {
-                connected = true
-                status.text = "Готов к звонку"
-            }
-
-            // Presence and ringing update controls without starting capture.
-            "devices" -> showDevices(json)
-            "ringing",
-            "incoming" -> showRinging(json, type)
-
-            // Media signaling is allowed only for the accepted current call.
-            "accepted" -> startAudio(json)
-            "offer",
-            "answer" -> audio?.remote(type, json.getString("sdp"))
-            "ice" -> audio?.candidate(json.getJSONObject("candidate"))
-
-            // Release media before displaying the terminal reason.
-            "ended" -> {
-                resetCall()
-                status.text = "Звонок завершён: ${json.getString("reason")}"
-            }
-
-            // Restore cached device controls after a rejected action.
-            "error" -> {
-                connectingCall = false
-                status.text = json.getString("message")
-                lastDevices?.let { receive(it) }
-            }
-        }
-    }
-
-    private fun showDevices(json: JSONObject) {
-        // Cache presence so an error can restore the device buttons.
-        lastDevices = json
-        devices.removeAllViews()
-        val list = json.getJSONArray("devices")
-
-        // Skip this endpoint in the list of available destinations.
-        for (i in 0 until list.length()) {
-            val device = list.getJSONObject(i)
-            if (device.getString("id") == deviceId) continue
-            devices.addView(
-                Button(this).apply {
-                    // Show identity and busy state without changing either.
-                    text =
-                        "Позвонить: ${device.getString("name")}" +
-                            if (device.getBoolean("busy")) " (занят)" else ""
-
-                    // Disable dialing while either endpoint is occupied.
-                    isEnabled =
-                        connected && callId == null && !connectingCall && !device.getBoolean("busy")
-
-                    // Validate permission before reserving an outgoing call.
-                    setOnClickListener {
-                        if (!hasMicrophonePermission()) {
-                            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
-                            return@setOnClickListener
-                        }
-
-                        // Prevent duplicate clicks while the server processes the call.
-                        if (callId != null || connectingCall) return@setOnClickListener
-                        connectingCall = true
-                        isEnabled = false
-                        status.text = "Вызов…"
-
-                        // The server assigns the new call ID.
-                        send(JSONObject().put("type", "call").put("target", device.getString("id")))
-                    }
-                }
-            )
-        }
-    }
-
-    private fun showRinging(json: JSONObject, type: String) {
-        // Replace the pending request with the server-assigned call.
-        callId = json.getString("callId")
-        connectingCall = false
-        val incoming = type == "incoming"
-        status.text = if (incoming) "Входящий: ${json.getString("name")}" else "Ожидаем ответа…"
-
-        // Enable only actions available during ringing.
-        accept.isEnabled = incoming
-        reject.isEnabled = incoming
-        hangup.isEnabled = true
-
-        // Play the system ringtone only for an incoming call.
-        if (incoming) {
-            val ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-            ringing = RingtoneManager.getRingtone(this, ringtoneUri)
-            ringing?.play()
-        }
-    }
-
-    private fun startAudio(json: JSONObject) {
-        // Stop ringing before entering media negotiation.
-        ringing?.stop()
-        accept.isEnabled = false
-        reject.isEnabled = false
-        status.text = "Соединяем звук…"
-
-        // Route conversation audio through the speaker.
-        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        @Suppress("DEPRECATION")
-        audioManager.isSpeakerphoneOn = true
-
-        // Bind signaling callbacks to this call identity.
-        val currentCall = callId
-        val sendMedia: (JSONObject) -> Unit = { message ->
-            if (callId == currentCall) send(message.put("callId", currentCall))
-        }
-
-        // Report media readiness independently from signaling state.
-        val reportMedia: (String) -> Unit = {
-            status.text = it
-            audioConnected = it == "Разговор"
-        }
-
-        // Create media only after the server confirms explicit acceptance.
-        audio = AudioCall(this, { runOnUiThread(it) }, sendMedia, reportMedia, { fail(it) })
-
-        // Only the caller creates the initial offer.
-        mute.isEnabled = true
-        if (json.getBoolean("initiator")) audio?.offer()
-
-        // Bound connection setup even after SDP has been exchanged.
-        val checkConnection = Runnable {
-            if (callId == currentCall && !audioConnected)
-                fail("Не удалось соединить устройства за 25 секунд")
-        }
-        handler.postDelayed(checkConnection, 25000)
-    }
-
-    private fun fail(message: String) {
-        // Notify the other participant before releasing local media.
-        command("hangup")
-        resetCall()
-        status.text = message
-    }
-
-    private fun resetCall() {
-        // Stop resources that can produce or capture audio.
-        ringing?.stop()
-        ringing = null
-        audio?.close()
-        audio = null
-
-        // Clear state before any delayed callback can run.
-        callId = null
-        connectingCall = false
-        muted = false
-        audioConnected = false
-
-        // Cancel setup timeout and restore normal audio routing.
-        handler.removeCallbacksAndMessages(null)
-        audioManager.mode = AudioManager.MODE_NORMAL
-        @Suppress("DEPRECATION")
-        audioManager.isSpeakerphoneOn = false
-
-        // Disable call controls until another call begins.
-        accept.isEnabled = false
-        reject.isEnabled = false
-        hangup.isEnabled = false
-        mute.isEnabled = false
-        mute.text = "Выключить микрофон"
-    }
-
-    private fun disconnect() {
-        // Invalidate callbacks before closing the old socket.
-        generation++
-        connected = false
-        socket?.close(1000, "Leaving")
-        socket = null
-
-        // Drop presence and call state tied to this connection.
-        lastDevices = null
-        resetCall()
-        devices.removeAllViews()
-    }
-
-    /** Disconnects when the MVP leaves the foreground. */
+    /** Drops only the screen observer, leaving the service and audio untouched. */
     override fun onStop() {
-        // Background operation is outside the MVP lifecycle.
+        CallUi.remove(observer)
         super.onStop()
-        if (!isChangingConfigurations) {
-            disconnect()
-            status.text = "Отключено. Нажмите «Подключиться»"
+    }
+
+    private fun enable() {
+        if (!permissions()) return
+        val config =
+            HomeConfig(
+                server.text.toString().trim(),
+                name.text.toString().trim(),
+                key.text.toString(),
+            )
+        // Reject incomplete configuration before saving or starting the service.
+        val valid = runCatching { config.address.toHttpUrl() }.isSuccess
+        if (!valid || config.name.isBlank() || config.name.length > 64 || config.key.isBlank()) {
+            status.text = "Проверьте адрес, имя (до 64 символов) и ключ"
+            return
+        }
+
+        // Save before asking Android to create or restore the foreground service.
+        runCatching {
+                settings.save(config)
+                settings.enabled = true
+                startForegroundService(Intent(this, HomeCallService::class.java).setAction("start"))
+            }
+            .onFailure {
+                settings.enabled = false
+                status.text = "Не удалось включить домашнюю связь"
+            }
+    }
+
+    private fun permissions(): Boolean {
+        val needed = mutableListOf(Manifest.permission.RECORD_AUDIO)
+        if (Build.VERSION.SDK_INT >= 33) needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        val missing = needed.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        // Continue this enable request only after Android returns its decision.
+        if (missing.isNotEmpty()) {
+            awaitingPermissions = true
+            requestPermissions(missing.toTypedArray(), 1)
+            return false
+        }
+
+        // Hidden notifications cannot provide a reliable answer action.
+        val manager = getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) {
+            status.text = "Разрешите уведомления в настройках Android"
+            return false
+        }
+        return true
+    }
+
+    /** Continues the explicit enable action only if all requested permissions were granted. */
+    override fun onRequestPermissionsResult(
+        code: Int,
+        permissions: Array<out String>,
+        results: IntArray,
+    ) {
+        // Ignore callbacks unrelated to the user's current enable request.
+        super.onRequestPermissionsResult(code, permissions, results)
+        if (code != 1 || !awaitingPermissions) return
+        awaitingPermissions = false
+        // Denial keeps availability disabled and leaves the form editable.
+        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED })
+            enable()
+        else status.text = "Для связи нужны микрофон и уведомления"
+    }
+
+    private fun command(action: String, target: String? = null, output: Int = 0) {
+        if (!CallUi.state.enabled) return
+        val intent = Intent(this, HomeCallService::class.java).setAction(action)
+        // Attach snapshot identity so stale actions cannot affect a later call.
+        intent
+            .putExtra("callId", CallUi.state.callId)
+            .putExtra("target", target)
+            .putExtra("route", output)
+        startService(intent)
+    }
+
+    private fun render(state: HomeState) {
+        status.text =
+            listOf(state.peerName, state.status).filter { it.isNotBlank() }.joinToString(" · ")
+        // Freeze configuration while the service owns registration.
+        server.isEnabled = !state.enabled
+        name.isEnabled = !state.enabled
+        key.isEnabled = !state.enabled
+        connect.isEnabled = !state.enabled
+        disconnect.isEnabled = state.enabled
+
+        // Enable only actions valid for the current server-assigned call.
+        accept.isEnabled = state.phase == CallPhase.INCOMING && state.readyToAnswer
+        reject.isEnabled = state.phase == CallPhase.INCOMING
+        hangup.isEnabled = state.callId != null
+        mute.isEnabled = state.phase in listOf(CallPhase.ACTIVE, CallPhase.HELD)
+        mute.text = if (state.muted) "Включить микрофон" else "Выключить микрофон"
+        route.isEnabled = state.callId != null && state.supportedRoutes != 0
+
+        // Presence is discarded on disconnect, so unavailable devices disappear.
+        devices.removeAllViews()
+        state.devices.forEach { device ->
+            val button = Button(this)
+            button.text = "Позвонить: ${device.name}" + if (device.busy) " (занят)" else ""
+            button.isEnabled =
+                state.connected && state.callId == null && !state.dialing && !device.busy
+            // Revalidate availability in the service when the user taps.
+            button.setOnClickListener { command("call", device.id) }
+            devices.addView(button)
         }
     }
 
-    /** Releases signaling resources owned by this activity. */
-    override fun onDestroy() {
-        // Stop callbacks before shutting down the HTTP client.
-        disconnect()
-        client.dispatcher.executorService.shutdown()
-        client.connectionPool.evictAll()
-        super.onDestroy()
+    @Suppress("DEPRECATION")
+    private fun chooseRoute() {
+        // Labels are mapped to the platform's supported audio routes.
+        val routes =
+            listOf(
+                CallAudioState.ROUTE_SPEAKER to "Громкая связь",
+                CallAudioState.ROUTE_EARPIECE to "Телефон",
+                CallAudioState.ROUTE_WIRED_HEADSET to "Проводная гарнитура",
+                CallAudioState.ROUTE_BLUETOOTH to "Bluetooth",
+            )
+        // Expose only routes currently reported by Telecom.
+        val available = routes.filter { it.first and CallUi.state.supportedRoutes != 0 }
+        AlertDialog.Builder(this)
+            .setTitle("Вывод звука")
+            .setItems(available.map { it.second }.toTypedArray()) { _, index ->
+                command("route", output = available[index].first)
+            }
+            .show()
     }
+
+    private fun batterySettings() {
+        // LAN-only incoming calls cannot rely on cloud push during Doze.
+        // Android asks the user; no battery setting is changed silently.
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        intent.data = Uri.parse("package:$packageName")
+        startActivity(intent)
+    }
+
+    private fun notificationSettings() {
+        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+        intent.putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        startActivity(intent)
+    }
+
+    private fun label(value: String) =
+        TextView(this).apply {
+            text = value
+            textSize = 20f
+            this@MainActivity.layout.addView(this)
+        }
+
+    private fun field(hintText: String, value: String) =
+        EditText(this).apply {
+            hint = hintText
+            setText(value)
+            isSingleLine = true
+            this@MainActivity.layout.addView(this)
+        }
+
+    private fun button(label: String, action: () -> Unit) =
+        Button(this).apply {
+            text = label
+            setOnClickListener { action() }
+            this@MainActivity.layout.addView(this)
+        }
 }
