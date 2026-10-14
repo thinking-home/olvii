@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.idea/
+.tools/
+*.user

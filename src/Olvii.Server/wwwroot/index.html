@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="ru">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Olvii</title>
+  <style>
+    body {
+      font:
+        16px system-ui,
+        sans-serif;
+      max-width: 620px;
+      margin: 40px auto;
+      padding: 0 20px;
+      background: #f5f6f8;
+      color: #20242b;
+    }
+    input,
+    button {
+      font: inherit;
+      padding: 10px;
+      border: 1px solid #bbc2cc;
+      border-radius: 6px;
+    }
+    input {
+      box-sizing: border-box;
+      width: 100%;
+      margin: 6px 0 16px;
+    }
+    button {
+      cursor: pointer;
+      background: white;
+      margin: 4px 4px 4px 0;
+    }
+    button:disabled {
+      cursor: default;
+      opacity: 0.45;
+    }
+    #status {
+      padding: 16px;
+      background: white;
+      border-radius: 8px;
+    }
+    small {
+      display: block;
+      color: #525e6e;
+      margin: 16px 0;
+    }
+    audio {
+      width: 100%;
+    }
+    #devices button {
+      display: block;
+      width: 100%;
+      text-align: left;
+    }
+  </style>
+  <h1>Olvii · домашняя связь</h1>
+  <form id="connection">
+    <label>Имя устройства<input id="name" maxlength="64" value="Браузер" required /></label>
+    <label>Общий ключ сервера<input id="key" type="password" autocomplete="off" required /></label>
+    <button id="connect">Подключиться</button>
+    <button id="disconnect" type="button" disabled>Отключиться</button>
+  </form>
+  <p id="status" role="status" aria-live="polite">Нет подключения</p>
+  <div>
+    <button id="accept" disabled>Ответить</button>
+    <button id="reject" disabled>Отклонить</button>
+    <button id="hangup" disabled>Завершить</button>
+    <button id="mute" disabled>Выключить микрофон</button>
+  </div>
+  <h2>Устройства</h2>
+  <div id="devices">Подключитесь к серверу.</div>
+  <audio id="remote" autoplay controls></audio>
+  <small
+    >Оставьте страницу открытой. Если звук не начался автоматически, нажмите ▶ на плеере. Для проверки рядом
+    с телефоном используйте наушники.</small
+  >
+  <small id="hint">Микрофон работает через HTTPS или http://localhost на компьютере с сервером.</small>
+  <script>
+    "use strict";
+    const $ = (id) => document.getElementById(id);
+
+    // A fresh ID per page also allows testing in two tabs without duplicate-device conflicts.
+    const deviceId = globalThis.crypto?.randomUUID?.();
+
+    // Signaling state belongs to the current connection.
+    let socket = null;
+    let connected = false;
+    let pending = false;
+
+    // Call state and presence are reset when signaling disconnects.
+    let devices = [];
+    let call = null;
+    let generation = 0;
+    const report = (text) => {
+      $("status").textContent = text;
+    };
+
+    // Check secure-context and media support before enabling connection.
+    const available =
+      isSecureContext &&
+      !!navigator.mediaDevices?.getUserMedia &&
+      !!globalThis.RTCPeerConnection &&
+      !!deviceId;
+
+    // Explain why microphone access is unavailable on plain LAN HTTP.
+    if (!available) {
+      $("connect").disabled = true;
+      report(
+        "Для микрофона откройте эту страницу через HTTPS или http://localhost:5080 на компьютере с сервером.",
+      );
+    }
+
+    function render() {
+      // Lock the connection form while a socket is active.
+      $("connect").disabled = !available || !!socket || pending;
+      $("disconnect").disabled = !socket && !pending;
+      $("name").disabled = !!socket || pending;
+      $("key").disabled = !!socket || pending;
+
+      // Answer and reject are available only while ringing.
+      $("accept").disabled = !call || call.state !== "incoming";
+      $("reject").disabled = !call || call.state !== "incoming";
+      $("hangup").disabled = !call;
+      $("mute").disabled = !call?.stream;
+
+      // Reflect microphone state without recreating media.
+      $("mute").textContent = call?.muted ? "Включить микрофон" : "Выключить микрофон";
+
+      // Rebuild presence using server-provided busy flags.
+      $("devices").replaceChildren();
+      const others = devices.filter((d) => d.id !== deviceId);
+
+      // Keep an explanatory empty state.
+      if (!others.length)
+        $("devices").textContent = connected ? "Других устройств пока нет." : "Подключитесь к серверу.";
+      for (const device of others) {
+        // Render remote names as text, never HTML.
+        const button = document.createElement("button");
+        button.textContent = `Позвонить: ${device.name}${device.busy ? " (занят)" : ""}`;
+        button.disabled = !connected || !!call || pending || device.busy;
+
+        // Reserve the outgoing action until the server responds.
+        button.onclick = () => {
+          pending = true;
+          render();
+          report("Вызов…");
+          send({ type: "call", target: device.id });
+        };
+
+        // Append the fully configured destination button.
+        $("devices").append(button);
+      }
+    }
+    /** Sends a signaling object; returns false if the connection was lost. */
+    function send(message) {
+      // Handle a lost connection before attempting a write.
+      if (socket?.readyState !== WebSocket.OPEN) {
+        disconnect("Соединение потеряно");
+        return false;
+      }
+
+      // Serialize one complete signaling command.
+      socket.send(JSON.stringify(message));
+      return true;
+    }
+    /** Sends an SDP description for a specific call. */
+    function sendDescription(current, type, sdp) {
+      send({ type, callId: current.id, sdp });
+    }
+
+    /** Sends a command scoped to the current call, if one exists. */
+    function command(type) {
+      if (call) send({ type, callId: call.id });
+    }
+    function cleanup() {
+      // Detach current state before callbacks can arrive.
+      const old = call;
+      call = null;
+      pending = false;
+
+      // Stop capture and close the peer owned by the old call.
+      if (old) {
+        clearTimeout(old.timer);
+        old.pc?.close();
+        old.stream?.getTracks().forEach((t) => t.stop());
+      }
+
+      // Remove playback and restore the idle presentation.
+      $("remote").srcObject = null;
+      document.title = "Olvii";
+      render();
+    }
+    function disconnect(message = "Отключено") {
+      // Invalidate callbacks before closing the old signaling socket.
+      generation++;
+      const old = socket;
+      socket = null;
+      connected = false;
+      devices = [];
+
+      // Close transport after detaching it from current state.
+      old?.close();
+      cleanup();
+      report(message);
+    }
+    function fail(current, error) {
+      // Ignore failures arriving after the call was replaced.
+      if (call !== current) return;
+      command("hangup");
+      cleanup();
+
+      // Give permission denial an actionable explanation.
+      report(
+        error?.name === "NotAllowedError"
+          ? "Разрешите доступ к микрофону и повторите звонок."
+          : `Ошибка аудиосвязи: ${error?.message || error}`,
+      );
+    }
+    /** Starts media for an accepted call; only the initiator creates an offer. */
+    async function startMedia(current, initiator) {
+      // Show negotiation separately from an established conversation.
+      current.state = "connecting";
+      render();
+      report("Соединяем звук…");
+
+      // Create a peer with local-network ICE only.
+      const pc = (current.pc = new RTCPeerConnection({ iceServers: [] }));
+      current.ice = [];
+      current.remoteReady = false;
+
+      // Bound setup even if no connection-failure callback arrives.
+      current.timer = setTimeout(() => fail(current, "Устройства не соединились за 25 секунд"), 25000);
+
+      // Register events before starting capture or negotiation.
+      bindMediaEvents(current, pc);
+
+      // Do not block ended/disconnect events while a microphone permission prompt is open.
+      current.mediaReady = captureAudio(current, pc);
+
+      // Only the caller creates an offer after capture is ready.
+      await current.mediaReady;
+      if (call !== current || !initiator) return;
+      const offer = await pc.createOffer();
+      if (call !== current) return;
+
+      // Publish SDP only after WebRTC applies it locally.
+      await pc.setLocalDescription(offer);
+      if (call === current) sendDescription(current, "offer", pc.localDescription.sdp);
+    }
+
+    // Capture may finish after hangup; ownership is checked in the callback.
+    function captureAudio(current, pc) {
+      // Request only audio, with the browser's speech processing enabled.
+      const constraints = {
+        audio: { echoCancellation: true, noiseSuppression: true },
+        video: false,
+      };
+
+      // Attach a late grant only if this call still owns the capture request.
+      return navigator.mediaDevices.getUserMedia(constraints).then((stream) => {
+        // Release a late microphone grant instead of reviving an ended call.
+        if (call !== current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
+        // Attach accepted capture tracks to the peer.
+        current.stream = stream;
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+        render();
+      });
+    }
+
+    function bindMediaEvents(current, pc) {
+      // Relay candidates only while this call remains current.
+      pc.onicecandidate = (event) => {
+        if (call === current && event.candidate)
+          send({
+            type: "ice",
+            callId: current.id,
+            candidate: event.candidate.toJSON(),
+          });
+      };
+
+      // Attach incoming audio to the page player.
+      pc.ontrack = (event) => {
+        if (call !== current) return;
+        $("remote").srcObject = event.streams[0] || new MediaStream([event.track]);
+
+        // Let the user start playback when autoplay is blocked.
+        $("remote")
+          .play()
+          .catch(() => {
+            if (call === current)
+              $("hint").textContent = "Нажмите ▶ на плеере, чтобы включить звук собеседника.";
+          });
+      };
+
+      // Ignore peer state updates from a previous call.
+      pc.onconnectionstatechange = () => {
+        if (call !== current) return;
+
+        // Cancel the setup deadline only when media connects.
+        if (pc.connectionState === "connected") {
+          clearTimeout(current.timer);
+          report("Разговор");
+        }
+
+        // Distinguish failed setup from a potentially temporary disconnect.
+        if (pc.connectionState === "failed")
+          fail(current, "Проверьте связь между устройствами в локальной сети");
+        if (pc.connectionState === "disconnected") report("Связь прервана…");
+      };
+    }
+
+    // Dispatch server events without blocking on microphone permission.
+    async function receive(message) {
+      if (
+        ["accepted", "offer", "answer", "ice", "ended"].includes(message.type) &&
+        message.callId !== call?.id
+      )
+        return;
+
+      // Each branch updates one part of connection or call state.
+      switch (message.type) {
+        // Registration completes the pending connection attempt.
+        case "welcome":
+          connected = true;
+          pending = false;
+          report("Готов к звонку");
+          break;
+
+        // Presence snapshots replace the previous list.
+        case "devices":
+          devices = message.devices;
+          break;
+
+        // Assign the server call ID before enabling answer controls.
+        case "incoming":
+        case "ringing":
+          pending = false;
+          call = {
+            id: message.callId,
+            state: message.type === "incoming" ? "incoming" : "ringing",
+          };
+
+          // Display the caller without starting capture.
+          report(message.type === "incoming" ? `Входящий: ${message.name}` : "Ожидаем ответа…");
+
+          // Make an incoming call visible in the tab title.
+          if (message.type === "incoming") document.title = "☎ Входящий · Olvii";
+          break;
+
+        // Start media asynchronously so hangup events remain responsive.
+        case "accepted": {
+          const current = call;
+          startMedia(current, message.initiator).catch((error) => fail(current, error));
+          break;
+        }
+
+        // Apply remote SDP only after local capture is attached.
+        case "offer":
+        case "answer": {
+          const current = call;
+          try {
+            await current.mediaReady;
+            if (call !== current) return;
+
+            // Apply SDP before draining early ICE candidates.
+            await current.pc.setRemoteDescription({
+              type: message.type,
+              sdp: message.sdp,
+            });
+            if (call !== current) return;
+
+            // Keep arrivals queued until all earlier candidates have been applied.
+            while (current.ice.length) await current.pc.addIceCandidate(current.ice.shift());
+            current.remoteReady = true;
+
+            // Only an offer requires generating a local answer.
+            if (message.type === "offer") {
+              const answer = await current.pc.createAnswer();
+              if (call !== current) return;
+
+              // Send the answer after the local description succeeds.
+              await current.pc.setLocalDescription(answer);
+              if (call === current) sendDescription(current, "answer", current.pc.localDescription.sdp);
+            }
+          } catch (error) {
+            fail(current, error);
+          }
+          break;
+        }
+
+        // Queue early candidates until remote SDP is ready.
+        case "ice": {
+          const current = call;
+          if (!current.remoteReady) current.ice.push(message.candidate);
+          else
+            // A malformed candidate must follow the normal call-failure path.
+            try {
+              await current.pc.addIceCandidate(message.candidate);
+            } catch (error) {
+              fail(current, error);
+            }
+          break;
+        }
+
+        // Translate termination reasons at the UI boundary.
+        case "ended": {
+          const reasons = {
+            rejected: "Вызов отклонён",
+            hangup: "Звонок завершён",
+            timeout: "Нет ответа",
+            disconnected: "Собеседник отключился",
+          };
+
+          // Release media before presenting the terminal state.
+          cleanup();
+          report(reasons[message.reason] || "Звонок завершён");
+          break;
+        }
+
+        // Release pending UI actions while preserving the active call.
+        case "error":
+          pending = false;
+
+          // Translate known protocol errors and preserve unknown diagnostics.
+          report(
+            {
+              "Device unavailable": "Устройство недоступно",
+              "Device busy": "Устройство занято",
+              "Call unavailable": "Вызов уже завершён",
+            }[message.message] || message.message,
+          );
+          break;
+      }
+
+      // Apply event changes to controls and device availability together.
+      render();
+    }
+
+    // Connect only in response to an explicit form submission.
+    $("connection").onsubmit = async (event) => {
+      event.preventDefault();
+      if (socket || pending || !available) return;
+
+      // Tag this attempt so late fetch results cannot reconnect it.
+      const currentGeneration = ++generation;
+      pending = true;
+      render();
+      report("Подключение…");
+      try {
+        // Exchange the shared key for a short-lived WebSocket ticket.
+        const response = await fetch("/api/tickets", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${$("key").value}` },
+          cache: "no-store",
+        });
+
+        // Explain authentication failure before opening a socket.
+        if (!response.ok)
+          throw new Error(response.status === 401 ? "Неверный ключ сервера" : `Сервер: ${response.status}`);
+
+        // Discard the ticket when the user has already disconnected.
+        const { ticket } = await response.json();
+        if (generation !== currentGeneration) return;
+
+        // Use the same origin and matching secure transport.
+        const url = new URL("/api/connect", location.href);
+        url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+
+        // Only the one-use ticket goes into the WebSocket URL.
+        url.search = new URLSearchParams({
+          id: deviceId,
+          name: $("name").value.trim() || "Браузер",
+          ticket,
+        });
+
+        // Bind events to the exact socket created by this attempt.
+        const ws = (socket = new WebSocket(url));
+
+        // Parse events only from the current signaling connection.
+        ws.onmessage = (event) => {
+          if (socket !== ws) return;
+          try {
+            receive(JSON.parse(event.data)).catch((error) => {
+              if (socket === ws) disconnect(`Ошибка протокола: ${error.message}`);
+            });
+          } catch {
+            disconnect("Некорректное сообщение сервера");
+          }
+        };
+
+        // Do not let an obsolete socket disconnect its replacement.
+        ws.onclose = () => {
+          if (socket === ws) disconnect("Соединение закрыто. Нажмите «Подключиться».");
+        };
+
+        // Restore retry controls on a failed handshake.
+        ws.onerror = () => {
+          if (socket === ws) disconnect("Не удалось подключиться к серверу");
+        };
+        render();
+      } catch (error) {
+        if (generation === currentGeneration) disconnect(error.message);
+      }
+    };
+
+    // Explicit disconnection releases signaling and media together.
+    $("disconnect").onclick = () => disconnect();
+
+    // Disable duplicate answers before sending acceptance.
+    $("accept").onclick = () => {
+      if (call?.state === "incoming") {
+        call.state = "accepting";
+        render();
+        command("accept");
+      }
+    };
+
+    // Reject without requesting the microphone.
+    $("reject").onclick = () => command("reject");
+
+    // Notify the server before clearing local media.
+    $("hangup").onclick = () => {
+      command("hangup");
+      cleanup();
+      report("Звонок завершён");
+    };
+
+    // Mute the existing track rather than rebuilding the connection.
+    $("mute").onclick = () => {
+      if (call?.stream) {
+        call.muted = !call.muted;
+        call.stream.getAudioTracks().forEach((t) => (t.enabled = !call.muted));
+        render();
+      }
+    };
+
+    // Leaving the page releases microphone and signaling resources.
+    window.addEventListener("pagehide", () => disconnect());
+    render();
+  </script>
+</html>
